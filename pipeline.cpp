@@ -45,6 +45,7 @@ static const i64 FAR = INT64_MAX;  // valid number, outside any window
 
 static bool PROF = false;
 static int EXP = 0;
+static int STOP = 0;  // parse experiments: stop after a stage
 static thread_local u64 nl_count = 0;
 static auto T0 = chrono::steady_clock::now();
 static void prof(const char* what) {
@@ -95,15 +96,29 @@ static void parallel_for(size_t n, const function<void(size_t, int)>& fn) {
     }
     atomic<size_t> next(0);
     vector<thread> ts;
+    vector<double> busy(NT, 0), done(NT, 0);
+    auto w0 = chrono::steady_clock::now();
     for (int t = 0; t < NT; t++)
         ts.emplace_back([&, t] {
             for (;;) {
                 size_t i = next.fetch_add(1);
                 if (i >= n) break;
+                auto a = chrono::steady_clock::now();
                 fn(i, t);
+                busy[t] += chrono::duration<double>(chrono::steady_clock::now() - a).count();
             }
+            done[t] = chrono::duration<double>(chrono::steady_clock::now() - w0).count();
         });
     for (auto& x : ts) x.join();
+    if (PROF) {
+        double wall = chrono::duration<double>(chrono::steady_clock::now() - w0).count();
+        double mn = 1e9, mx = 0, sum = 0, fmn = 1e9, fmx = 0;
+        for (int t = 0; t < NT; t++) {
+            mn = min(mn, busy[t]); mx = max(mx, busy[t]); sum += busy[t];
+            fmn = min(fmn, done[t]); fmx = max(fmx, done[t]);
+        }
+        fprintf(stderr, "    pf n=%zu wall %.3f  busy avg %.3f min %.3f max %.3f  first-done %.3f last-done %.3f\n", n, wall, sum / NT, mn, mx, fmn, fmx);
+    }
 }
 
 // --------------------------------------------------------------------- files
@@ -333,6 +348,21 @@ static inline i64 days_from_civil(i64 y, unsigned m, unsigned d) {
 }
 static inline bool dg(char c) { return (unsigned)(c - '0') < 10; }
 static inline int d2(const char* p) { return (p[0] - '0') * 10 + (p[1] - '0'); }
+// Days since epoch for every (year, month, day) in the 4 years around the
+// window, or INT32_MIN for impossible dates; other years take the slow path.
+static int g_y0 = -100000;
+static i32 g_dtab[4 * 12 * 32];
+static void init_dates(int y0) {
+    g_y0 = y0;
+    static const int dim[13] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    for (int yi = 0; yi < 4; yi++)
+        for (int m = 1; m <= 12; m++)
+            for (int d = 0; d < 32; d++) {
+                int y = y0 + yi, md = dim[m];
+                if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) md = 29;
+                g_dtab[(yi * 12 + m - 1) * 32 + d] = (d >= 1 && d <= md) ? (i32)days_from_civil(y, m, d) : INT32_MIN;
+            }
+}
 static inline i64 parse_ts(const char* p, u32 n) {
     if (n == 0) return BAD;
     if (dg(p[0]) && (n < 5 || dg(p[4]))) {  // maybe F3
@@ -381,7 +411,15 @@ static inline i64 parse_ts(const char* p, u32 n) {
         if (sg == '-') off = -off;
     }
     int y = d2(p) * 100 + d2(p + 2), mo = d2(p + 5), d = d2(p + 8), h = d2(p + 11), mi = d2(p + 14), s = d2(p + 17);
-    if (mo < 1 || mo > 12 || d < 1 || h > 23 || mi > 59 || s > 59) return BAD;
+    if (h > 23 || mi > 59 || s > 59) return BAD;
+    const unsigned yi = (unsigned)(y - g_y0);
+    if (yi < 4 && (unsigned)(mo - 1) < 12) {  // d is 0..99 here; >= 32 is never a valid day
+        if (d >= 32) return BAD;
+        const i32 dd = g_dtab[(yi * 12 + mo - 1) * 32 + d];
+        if (dd == INT32_MIN) return BAD;
+        return (((i64)dd * 24 + h) * 60 + mi) * 60000 + (i64)s * 1000 - off;
+    }
+    if (mo < 1 || mo > 12 || d < 1) return BAD;
     static const int dim[13] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
     int md = dim[mo];
     if (mo == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) md = 29;
@@ -639,6 +677,7 @@ int main(int argc, char** argv) {
 #endif
     PROF = getenv("PROFILE") != nullptr;
     EXP = atoi(env("EXP", "0").c_str());
+    STOP = atoi(env("STOP", "0").c_str());
     string DATA = env("DATA_DIR", "/data"), OUT = env("OUTPUT_DIR", "/output");
     if (argc >= 3) { DATA = argv[1]; OUT = argv[2]; }
     NT = atoi(env("NCPU", "0").c_str());
@@ -651,6 +690,7 @@ int main(int argc, char** argv) {
     string ws = json_str(ms, "window_start"), we = json_str(ms, "window_end");
     const i64 WS = parse_ts(ws.data(), (u32)ws.size()), WE = parse_ts(we.data(), (u32)we.size());
     const i64 CWS = WS - WEEK;
+    if (!getenv("NODATES") && ws.size() >= 4 && dg(ws[0]) && dg(ws[1]) && dg(ws[2]) && dg(ws[3])) init_dates(atoi(ws.substr(0, 4).c_str()) - 1);
     if (WE - WS > (i64)UINT32_MAX) { fputs("window too long\n", stderr); return 1; }
     const i64 DAY0 = fdiv(WS, DAY);
     const int NDAYS = (int)(fdiv(WE - 1, DAY) - DAY0 + 1);
@@ -865,6 +905,10 @@ int main(int argc, char** argv) {
         parallel_for(NT, [&](size_t t, int) {
             for (int b = 0; b < EB; b++) kb[t * EB + b].reserve(per);
             for (int b = 0; b < UB; b++) ub[t * UB + b].reserve(pp);
+            if (EXP == 30) {  // experiment: fault in the reserved output pages before parsing
+                for (int b = 0; b < EB; b++) { char* q = (char*)kb[t * EB + b].data(); size_t z = kb[t * EB + b].capacity() * sizeof(DK); for (size_t o = 0; o < z; o += 4096) q[o] = 0; }
+                for (int b = 0; b < UB; b++) { char* q = (char*)ub[t * UB + b].data(); size_t z = ub[t * UB + b].capacity() * sizeof(PE); for (size_t o = 0; o < z; o += 4096) q[o] = 0; }
+            }
         });
     }
     {
@@ -872,7 +916,7 @@ int main(int argc, char** argv) {
         make_chunks(evf, ech, 1 << 22);
         make_chunks(ckf, cch, 1 << 22);
         size_t ne = ech.size();
-        parallel_for(ne + cch.size(), [&](size_t i, int t) {
+        auto parseTask = [&](size_t i, int t) {
             if (EXP == 16) return;
             if (EXP == 17) { const Chunk& c = i < ne ? ech[i] : cch[i - ne]; const File& F = i < ne ? evf[c.file] : ckf[c.file]; u64 acc = 0; for (size_t q = c.s; q < c.e; q += 64) acc += (u8)F.data[q]; nl_count += acc; return; }
             if (i < ne) {
@@ -880,12 +924,12 @@ int main(int argc, char** argv) {
                 vector<PE>* B = &ub[(size_t)t * UB];
                 for_fields<7>(evf[ech[i].file], ech[i].s, ech[i].e, [&](const View* f) {
                     if (f[0].n == 0) return;
-                    if (EXP == 11) { nl_count += f[0].n; return; }
+                    if (STOP == 1) { nl_count += f[0].n; return; }
                     DK k;
                     k.eh = hstr(f[0].p, f[0].n);
-                    if (EXP == 12) { nl_count += k.eh + hstr(f[1].p, f[1].n); return; }
+                    if (STOP == 2) { nl_count += k.eh + hstr(f[1].p, f[1].n); return; }
                     i64 ing = parse_ts(f[3].p, f[3].n);
-                    if (EXP == 13) { nl_count += k.eh + ing + parse_ts(f[2].p, f[2].n) + hstr(f[1].p, f[1].n); return; }
+                    if (STOP == 3) { nl_count += k.eh + ing + parse_ts(f[2].p, f[2].n) + hstr(f[1].p, f[1].n); return; }
                     k.ingest = ing == BAD ? FAR : ing;
                     k.loc = NOLOC;
                     do {
@@ -923,9 +967,9 @@ int main(int argc, char** argv) {
                         u64 pp = e.ph >> (64 - UBITS);
                         auto& dst = B[pp];
                         k.loc = ((u64)t << 48) | (pp << 32) | (u64)dst.size();
-                        if (EXP != 15) dst.push_back(e); else nl_count += e.ph;
+                        if (STOP != 5) dst.push_back(e); else nl_count += e.ph;
                     } while (0);
-                    if (EXP != 14) KB[k.eh >> 56].push_back(k); else nl_count += k.eh;
+                    if (STOP != 4 && STOP != 5) KB[k.eh >> 56].push_back(k); else nl_count += k.eh;
                 });
             } else {
                 const Chunk& c = cch[i - ne];
@@ -945,7 +989,20 @@ int main(int argc, char** argv) {
                     B[k.ph >> (64 - UBITS)].push_back(k);
                 });
             }
-        });
+        };
+        // EXP=40: repeat the parse step in-process (buffers kept, so no page
+        // faults after the first run) and print each run: a steadier measure.
+        const int reps = EXP == 40 ? 7 : 1;
+        for (int r = 0; r < reps; r++) {
+            if (r) {
+                for (auto& v : kb) v.clear();
+                for (auto& v : ub) v.clear();
+                for (auto& v : cub) v.clear();
+            }
+            auto a = chrono::steady_clock::now();
+            parallel_for(ne + cch.size(), parseTask);
+            if (EXP == 40) fprintf(stderr, "rep %d parse %.4f\n", r, chrono::duration<double>(chrono::steady_clock::now() - a).count());
+        }
     }
     prof("parse");
     linker.join();
