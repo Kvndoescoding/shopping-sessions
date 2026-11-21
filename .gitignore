@@ -1,0 +1,4 @@
+pipeline
+*.exe
+out/
+dev/
