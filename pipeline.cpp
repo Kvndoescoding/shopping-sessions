@@ -19,6 +19,10 @@
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
+#ifdef _WIN32
+extern "C" __declspec(dllimport) int __stdcall SetProcessAffinityMask(void*, unsigned long long);
+extern "C" __declspec(dllimport) void* __stdcall GetCurrentProcess(void);
+#endif
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -212,6 +216,8 @@ static inline u64 bit_range(u32 a, u32 b) {  // bits [a, b), 0 <= a <= b <= 64
 }
 template <int NF, class F>
 static void for_fields(const File& f, size_t s, size_t e, F&& fn) {
+    // One streaming pass: every 64-byte block is classified once (commas,
+    // quotes, newlines), and field / line state carries across blocks.
     const char* base = f.data;
     const char* end = base + f.size;
     const char* p;
@@ -226,78 +232,86 @@ static void for_fields(const File& f, size_t s, size_t e, F&& fn) {
         p = nl + 1;
     }
     const char* lim = base + e;
+    if (p >= lim || p >= end) return;
     View fl[NF];
-    while (p < lim) {
+    int k = 0;
+    u32 qc = 0;
+    bool bad = false;
+    const char* fs = p;  // current field start
+    auto emit = [&](const char* a, const char* b, u32 fq) {
+        if (k >= NF) { bad = true; return; }
+        u32 len = (u32)(b - a);
+        if (fq == 0) fl[k] = View{a, len};
+        else if (fq == 2 && len >= 2 && a[0] == '"' && b[-1] == '"') fl[k] = View{a + 1, len - 2};
+        else bad = true;
+        k++;
+    };
 #ifdef __AVX2__
-        {
-            const char* w = p;
-            const char* fs = p;
-            int k = 0;
-            u32 qc = 0;
-            bool bad = false;
-            const char* next = nullptr;
-            const __m256i vc = _mm256_set1_epi8(','), vq = _mm256_set1_epi8('"'), vn = _mm256_set1_epi8('\n');
-            auto emit = [&](const char* a, const char* b, u32 fq) {
-                if (k >= NF) { bad = true; return; }
-                u32 len = (u32)(b - a);
-                if (fq == 0) fl[k] = View{a, len};
-                else if (fq == 2 && len >= 2 && a[0] == '"' && b[-1] == '"') fl[k] = View{a + 1, len - 2};
-                else bad = true;
-                k++;
-            };
-            while (end - w >= 64) {
-                __m256i x0 = _mm256_loadu_si256((const __m256i*)w), x1 = _mm256_loadu_si256((const __m256i*)(w + 32));
-                u64 C = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x0, vc)) |
-                        ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x1, vc)) << 32);
-                u64 Q = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x0, vq)) |
-                        ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x1, vq)) << 32);
-                u64 N = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x0, vn)) |
-                        ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x1, vn)) << 32);
-                u32 nb = N ? (u32)__builtin_ctzll(N) : 64;
-                u64 lm = bit_range(0, nb);
-                u64 cm = C & lm, qm = Q & lm;
-                u32 sb = fs > w ? (u32)(fs - w) : 0;  // a field that began in an earlier window starts at bit 0
-                while (cm) {
-                    u32 idx = (u32)__builtin_ctzll(cm);
-                    cm &= cm - 1;
-                    emit(fs, w + idx, qc + (u32)__builtin_popcountll(qm & bit_range(sb, idx)));
-                    fs = w + idx + 1;
-                    sb = idx + 1;
-                    qc = 0;
-                }
-                if (nb < 64) {
-                    emit(fs, w + nb, qc + (u32)__builtin_popcountll(qm & bit_range(sb, nb)));
-                    next = w + nb + 1;
-                    break;
-                }
-                qc += (u32)__builtin_popcountll(qm & bit_range(sb, 64));
-                w += 64;
-            }
-            if (next) {
-                if (EXP == 9) {
-                    View g[NF];
-                    bool ok2 = split(p, next - 1, NF, g);
-                    bool ok1 = !bad && k == NF;
-                    bool same = ok1 == ok2;
-                    if (same && ok1)
-                        for (int z = 0; z < NF; z++)
-                            if (g[z].p != fl[z].p || g[z].n != fl[z].n) same = false;
-                    if (!same) {
-                        static atomic<int> shown(0);
-                        if (shown++ < 5) fprintf(stderr, "MISMATCH simd=%d scalar=%d line=[%.*s]\n", ok1, ok2, (int)(next - 1 - p), p);
-                    }
-                }
+    const __m256i vc = _mm256_set1_epi8(','), vq = _mm256_set1_epi8('"'), vn = _mm256_set1_epi8('\n');
+    alignas(64) char tail[64];
+    const char* w = p;
+    for (;;) {
+        const char* src = w;
+        u64 valid = ~0ull;
+        bool last = false;
+        if (end - w < 64) {
+            size_t r = (size_t)(end - w);
+            memcpy(tail, w, r);
+            memset(tail + r, 0, 64 - r);
+            src = tail;
+            valid = bit_range(0, (u32)r);
+            last = true;
+        }
+        __m256i x0 = _mm256_loadu_si256((const __m256i*)src), x1 = _mm256_loadu_si256((const __m256i*)(src + 32));
+        u64 C = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x0, vc)) |
+                ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x1, vc)) << 32);
+        u64 Q = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x0, vq)) |
+                ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x1, vq)) << 32);
+        u64 N = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x0, vn)) |
+                ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x1, vn)) << 32);
+        C &= valid;
+        Q &= valid;
+        N &= valid;
+        u64 S = C | N;
+        u32 sb = fs > w ? (u32)(fs - w) : 0;
+        while (S) {
+            u32 idx = (u32)__builtin_ctzll(S);
+            S &= S - 1;
+            emit(fs, w + idx, qc + (u32)__builtin_popcountll(Q & bit_range(sb, idx)));
+            fs = w + idx + 1;
+            sb = idx + 1;
+            qc = 0;
+            if ((N >> idx) & 1) {
                 if (!bad && k == NF) fn(fl);
-                p = next;
-                continue;
+                k = 0;
+                bad = false;
+                if (fs >= lim) return;  // the next line belongs to the next chunk
             }
         }
-#endif
+        qc += (u32)__builtin_popcountll(Q & bit_range(sb, 64));
+        if (last || w + 64 >= end) {
+            // end of file: a last line without a trailing newline
+            if (fs < end) {
+                const char* a = fs;
+                // count quotes of the unfinished field directly (simple, runs once per file)
+                u32 fq = 0;
+                for (const char* c = a; c < end; c++) fq += (*c == '"');
+                emit(a, end, fq);
+                if (!bad && k == NF) fn(fl);
+            }
+            return;
+        }
+        w += 64;
+    }
+#else
+    while (p < lim) {
         const char* nl = (const char*)memchr(p, '\n', end - p);
         const char* le = nl ? nl : end;
         if (split(p, le, NF, fl)) fn(fl);
         p = nl ? nl + 1 : end;
     }
+    (void)k; (void)qc; (void)bad; (void)fs; (void)emit;
+#endif
 }
 struct Chunk {
     int file;
@@ -336,10 +350,24 @@ static inline i64 parse_ts(const char* p, u32 n) {
         }
     }
     if (n != 20 && n != 25) return BAD;
+#ifdef __AVX2__
+    {
+        // "YYYY-MM-DDTHH:MM" checked in one go: digits where digits belong, separators elsewhere
+        const __m128i v = _mm_loadu_si128((const __m128i*)p);  // n >= 20, so 16 bytes are in the field
+        const __m128i d = _mm_sub_epi8(v, _mm_set1_epi8('0'));
+        const int dm = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d));
+        const __m128i tmpl = _mm_setr_epi8('0', '0', '0', '0', '-', '0', '0', '-', '0', '0', 'T', '0', '0', ':', '0', '0');
+        const int em = _mm_movemask_epi8(_mm_cmpeq_epi8(v, tmpl));
+        const int DIG = 0xDB6F;  // bytes 0-3, 5-6, 8-9, 11-12, 14-15
+        const int SEP = 0x2490;  // bytes 4, 7, 10, 13
+        if ((dm & DIG) != DIG || (em & SEP) != SEP || p[16] != ':' || !dg(p[17]) || !dg(p[18])) return BAD;
+    }
+#else
     if (!(dg(p[0]) && dg(p[1]) && dg(p[2]) && dg(p[3]) && p[4] == '-' && dg(p[5]) && dg(p[6]) && p[7] == '-' &&
           dg(p[8]) && dg(p[9]) && p[10] == 'T' && dg(p[11]) && dg(p[12]) && p[13] == ':' && dg(p[14]) &&
           dg(p[15]) && p[16] == ':' && dg(p[17]) && dg(p[18])))
         return BAD;
+#endif
     i64 off = 0;
     if (n == 20) {
         if (p[19] != 'Z') return BAD;
@@ -477,11 +505,21 @@ struct Col {
 static void put32(string& s, u32 v) { s.append((const char*)&v, 4); }
 static void put64(string& s, u64 v) { s.append((const char*)&v, 8); }
 static void write_parquet(const string& path, vector<Col>& cols, size_t nrows) {
-    string out = "PAR1";
+    // Pieces are written in order straight from each column's buffer: no
+    // concatenated copy of the file is ever built.
+    FILE* fp = fopen(path.c_str(), "wb");
+    if (!fp) { perror(path.c_str()); exit(3); }
+    setvbuf(fp, nullptr, _IOFBF, 1 << 20);
+    i64 pos = 0;
+    auto put = [&](const void* p, size_t n) {
+        if (n && fwrite(p, 1, n, fp) != n) { perror("write"); exit(3); }
+        pos += (i64)n;
+    };
+    put("PAR1", 4);
     struct Meta { i64 off, size; };
     vector<Meta> meta;
     for (auto& c : cols) {
-        string body;
+        string pre;  // definition levels (optional columns only)
         if (c.optional) {
             string rle;
             size_t i = 0;
@@ -495,14 +533,14 @@ static void write_parquet(const string& path, vector<Col>& cols, size_t nrows) {
                 rle.push_back((char)c.defs[i]);
                 i = j;
             }
-            put32(body, (u32)rle.size());
-            body += rle;
+            put32(pre, (u32)rle.size());
+            pre += rle;
         }
-        body += c.vals;
+        const i64 body = (i64)(pre.size() + c.vals.size());
         TW ph;
         ph.fi32(1, 0);  // DATA_PAGE
-        ph.fi32(2, (i64)body.size());
-        ph.fi32(3, (i64)body.size());
+        ph.fi32(2, body);
+        ph.fi32(3, body);
         ph.sbeg(5);
         ph.fi32(1, (i64)nrows);
         ph.fi32(2, 0);  // PLAIN
@@ -510,10 +548,12 @@ static void write_parquet(const string& path, vector<Col>& cols, size_t nrows) {
         ph.fi32(4, 3);
         ph.send();
         ph.byte(0);
-        i64 off = (i64)out.size();
-        out += ph.b;
-        out += body;
-        meta.push_back({off, (i64)(ph.b.size() + body.size())});
+        i64 off = pos;
+        put(ph.b.data(), ph.b.size());
+        put(pre.data(), pre.size());
+        put(c.vals.data(), c.vals.size());
+        string().swap(c.vals);
+        meta.push_back({off, (i64)ph.b.size() + body});
     }
     TW m;
     m.fi32(1, 1);
@@ -560,12 +600,10 @@ static void write_parquet(const string& path, vector<Col>& cols, size_t nrows) {
     m.fi64(3, (i64)nrows);
     m.send();
     m.byte(0);
-    out += m.b;
-    put32(out, (u32)m.b.size());
-    out += "PAR1";
-    FILE* fp = fopen(path.c_str(), "wb");
-    if (!fp) { perror(path.c_str()); exit(3); }
-    fwrite(out.data(), 1, out.size(), fp);
+    string tailb = m.b;
+    put32(tailb, (u32)m.b.size());
+    tailb += "PAR1";
+    put(tailb.data(), tailb.size());
     fclose(fp);
 }
 static void put_str(Col& c, const char* p, u32 n) {
@@ -595,6 +633,9 @@ int main(int argc, char** argv) {
         setenv("GLIBC_TUNABLES", "glibc.malloc.hugetlb=1", 1);
         execv("/proc/self/exe", argv);  // returns only on failure: carry on without it
     }
+#endif
+#ifdef _WIN32
+    if (const char* am = getenv("AFFINITY")) SetProcessAffinityMask(GetCurrentProcess(), strtoull(am, nullptr, 0));  // local benchmarking only
 #endif
     PROF = getenv("PROFILE") != nullptr;
     EXP = atoi(env("EXP", "0").c_str());
@@ -832,14 +873,19 @@ int main(int argc, char** argv) {
         make_chunks(ckf, cch, 1 << 22);
         size_t ne = ech.size();
         parallel_for(ne + cch.size(), [&](size_t i, int t) {
+            if (EXP == 16) return;
+            if (EXP == 17) { const Chunk& c = i < ne ? ech[i] : cch[i - ne]; const File& F = i < ne ? evf[c.file] : ckf[c.file]; u64 acc = 0; for (size_t q = c.s; q < c.e; q += 64) acc += (u8)F.data[q]; nl_count += acc; return; }
             if (i < ne) {
                 vector<DK>* KB = &kb[(size_t)t * EB];
                 vector<PE>* B = &ub[(size_t)t * UB];
                 for_fields<7>(evf[ech[i].file], ech[i].s, ech[i].e, [&](const View* f) {
                     if (f[0].n == 0) return;
+                    if (EXP == 11) { nl_count += f[0].n; return; }
                     DK k;
                     k.eh = hstr(f[0].p, f[0].n);
+                    if (EXP == 12) { nl_count += k.eh + hstr(f[1].p, f[1].n); return; }
                     i64 ing = parse_ts(f[3].p, f[3].n);
+                    if (EXP == 13) { nl_count += k.eh + ing + parse_ts(f[2].p, f[2].n) + hstr(f[1].p, f[1].n); return; }
                     k.ingest = ing == BAD ? FAR : ing;
                     k.loc = NOLOC;
                     do {
@@ -877,9 +923,9 @@ int main(int argc, char** argv) {
                         u64 pp = e.ph >> (64 - UBITS);
                         auto& dst = B[pp];
                         k.loc = ((u64)t << 48) | (pp << 32) | (u64)dst.size();
-                        dst.push_back(e);
+                        if (EXP != 15) dst.push_back(e); else nl_count += e.ph;
                     } while (0);
-                    KB[k.eh >> 56].push_back(k);
+                    if (EXP != 14) KB[k.eh >> 56].push_back(k); else nl_count += k.eh;
                 });
             } else {
                 const Chunk& c = cch[i - ne];
@@ -1009,7 +1055,7 @@ int main(int argc, char** argv) {
         for (int p = 0; p < PB; p++) order[p] = p;
         sort(order.begin(), order.end(), [&](size_t a, size_t b) { return sz[a] > sz[b]; });
     }
-    vector<vector<u32>> tcnt(NT, vector<u32>(NC, 0)), tpos(NT, vector<u32>(NC, 0)), tact(NT);
+    vector<vector<u32>> tcnt(NT, vector<u32>(NC, 0)), tpos(NT, vector<u32>(NC, 0));
     struct Scratch {
         vector<u64> hk;
         vector<u32> hv, pid, cpid, es, cs, w;
@@ -1063,6 +1109,7 @@ int main(int argc, char** argv) {
         if (S.ko.size() < S.cs[np]) S.ko.resize(S.cs[np]);
         for (size_t q = 0; q < m; q++)
             if (S.cpid[q] != UINT32_MAX) S.ko[S.w[S.cpid[q]]++] = K0[q];
+        if (EXP == 21) return;
         auto ckless = [](const CK& a, const CK& b) {
             if (a.ts != b.ts) return a.ts < b.ts;
             int c = memcmp(a.cid, b.cid, min(a.clen, b.clen));
@@ -1083,22 +1130,28 @@ int main(int argc, char** argv) {
             size_t cl = S.cs[q + 1] - S.cs[q];
             if (cl > 1) sort(c, c + cl, ckless);
         }
+        if (EXP == 20) return;
         Span<PE> E{S.eo.data(), n};
         Span<CK> K{S.ko.data(), S.cs[np]};
         CStat* CSt = cstat[t].data();
         auto& U = urows[t];
+        // Assists by intervals: a campaign is active for a run of consecutive
+        // sessions while it has a click in the window. When it leaves (or the
+        // person ends), its run is split by day and added in one step each,
+        // instead of +1 per session per active campaign.
         vector<u32>& cnt = tcnt[t];
-        vector<u32>& pos = tpos[t];
-        vector<u32>& active = tact[t];
-        auto add = [&](u32 c) { if (cnt[c]++ == 0) { pos[c] = (u32)active.size(); active.push_back(c); } };
-        auto rem = [&](u32 c) {
-            if (--cnt[c] == 0) {
-                u32 q = pos[c], l = active.back();
-                active[q] = l;
-                pos[l] = q;
-                active.pop_back();
+        vector<u32>& actS = tpos[t];  // session index at which the campaign became active
+        u32 sidx = 0;                 // index of the person's current session
+        vector<pair<i64, u32>> runs;  // (day, first session index), days ascending
+        auto aflush = [&](u32 c, u32 a, u32 b) {
+            for (size_t r = 0; r < runs.size() && a < b; r++) {
+                u32 rlo = runs[r].second, rhi = r + 1 < runs.size() ? runs[r + 1].second : sidx;
+                u32 x = max(a, rlo), y = min(b, rhi);
+                if (y > x) CSt[(size_t)(runs[r].first - DAY0) * NC + c].assist += y - x;
             }
         };
+        auto add = [&](u32 c) { if (cnt[c]++ == 0) actS[c] = sidx; };
+        auto rem = [&](u32 c) { if (--cnt[c] == 0) aflush(c, actS[c], sidx); };
         vector<pair<u16, i64>> cats;
         size_t i = 0, ka = 0;
         while (i < E.size()) {
@@ -1111,6 +1164,8 @@ int main(int argc, char** argv) {
             UR row{E[i].name, E[i].nlen, 0, 0, 0, 0, -1};
             i64 curDay = INT64_MIN;
             cats.clear();
+            sidx = 0;
+            runs.clear();
             auto flush = [&]() {
                 if (curDay == INT64_MIN) return;
                 row.day = (i32)curDay;
@@ -1129,7 +1184,7 @@ int main(int argc, char** argv) {
             while (s < j) {
                 const i64 start = WS + (i64)E[s].ts;
                 const i64 day = fdiv(start, DAY);
-                if (day != curDay) { flush(); curDay = day; }
+                if (day != curDay) { flush(); curDay = day; runs.push_back({day, sidx}); }
                 i64 prev = start, rev = 0;
                 int np = 0;
                 size_t e = s;
@@ -1164,7 +1219,7 @@ int main(int argc, char** argv) {
                 cs.sess++;
                 cs.psess += np > 0;
                 cs.rev += rev;
-                for (u32 c : active) CSt[di + c].assist++;
+                sidx++;
                 s = e;
             }
             flush();
@@ -1221,27 +1276,49 @@ int main(int argc, char** argv) {
         vector<Col> cols(6);
         cols[0] = {"user_id", 6, 0};
         cols[1] = {"day", 1, 6};
-        cols[2] = {"sessions", 2, -1};
-        cols[3] = {"events", 2, -1};
+        cols[2] = {"sessions", 1, -1};  // INT32: any integer width is accepted
+        cols[3] = {"events", 1, -1};
         cols[4] = {"revenue_cents", 2, -1};
         cols[5] = {"top_category", 6, 0, true};
-        size_t sb = 0;
-        for (auto& r : U) sb += r.nlen + 4;
-        cols[0].vals.reserve(sb);
-        cols[1].vals.reserve(U.size() * 4);
-        for (int k = 2; k < 5; k++) cols[k].vals.reserve(U.size() * 8);
-        cols[5].defs.reserve(U.size());
+        // exact sizes first, then fill each column through a raw pointer
+        const size_t nr = U.size();
+        size_t sb = 0, tb = 0, nt = 0;
         for (auto& r : U) {
-            put_str(cols[0], r.name, r.nlen);
-            put32(cols[1].vals, (u32)r.day);
-            put64(cols[2].vals, (u64)r.sessions);
-            put64(cols[3].vals, (u64)r.events);
-            put64(cols[4].vals, (u64)r.rev);
-            if (r.top >= 0) {
-                cols[5].defs.push_back(1);
-                put_str(cols[5], catNames[r.top].p, catNames[r.top].n);
-            } else cols[5].defs.push_back(0);
+            sb += r.nlen + 4;
+            if (r.top >= 0) { tb += catNames[r.top].n + 4; nt++; }
         }
+        cols[0].vals.resize(sb);
+        cols[1].vals.resize(nr * 4);
+        cols[2].vals.resize(nr * 4);
+        cols[3].vals.resize(nr * 4);
+        cols[4].vals.resize(nr * 8);
+        cols[5].vals.resize(tb);
+        cols[5].defs.resize(nr);
+        char* p0 = &cols[0].vals[0];
+        char* p5 = tb ? &cols[5].vals[0] : nullptr;
+        i32* p1 = nr ? (i32*)&cols[1].vals[0] : nullptr;
+        i32* p2 = nr ? (i32*)&cols[2].vals[0] : nullptr;
+        i32* p3 = nr ? (i32*)&cols[3].vals[0] : nullptr;
+        i64* p4 = nr ? (i64*)&cols[4].vals[0] : nullptr;
+        u8* d5 = cols[5].defs.data();
+        for (size_t q = 0; q < nr; q++) {
+            const UR& r = U[q];
+            memcpy(p0, &r.nlen, 4);
+            memcpy(p0 + 4, r.name, r.nlen);
+            p0 += 4 + r.nlen;
+            p1[q] = r.day;
+            p2[q] = (i32)r.sessions;
+            p3[q] = (i32)r.events;
+            p4[q] = r.rev;
+            if (r.top >= 0) {
+                const View& cn = catNames[r.top];
+                memcpy(p5, &cn.n, 4);
+                memcpy(p5 + 4, cn.p, cn.n);
+                p5 += 4 + cn.n;
+                d5[q] = 1;
+            } else d5[q] = 0;
+        }
+        (void)nt;
         write_parquet(OUT + "/user_daily/part-" + to_string(t) + ".parquet", cols, U.size());
     });
     prof("write");
