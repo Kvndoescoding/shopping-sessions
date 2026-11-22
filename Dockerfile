@@ -1,13 +1,14 @@
-# Shopping Sessions: native C++ pipeline.
-# Build stage compiles one static binary; the run stage only holds that binary.
-FROM debian:bookworm-slim AS build
-RUN apt-get update \
- && apt-get install -y --no-install-recommends g++ libc6-dev \
- && rm -rf /var/lib/apt/lists/*
-COPY pipeline.cpp /src/pipeline.cpp
-# Scorers are Cascade Lake or newer: AVX2/BMI2 are safe, tune for Cascade Lake.
-RUN g++ -O3 -march=x86-64-v3 -mtune=cascadelake -std=c++17 -pthread -static \
-        -o /pipeline /src/pipeline.cpp
+# Shopping Sessions: native Rust pipeline.
+# Build stage compiles one binary; the run stage only holds that binary.
+# Build from this folder:  docker build -t shopping-sessions-rs .
+FROM rust:1.100.0-slim-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src/main.rs src/main.rs
+# Scorers are Cascade Lake or newer: AVX2/BMI2 are safe (same level as the C++ build).
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
+RUN cargo build --release --locked \
+ && cp target/release/pipeline /pipeline
 
 FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app

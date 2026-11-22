@@ -1,4 +1,6 @@
 .git
+target
+cpp
 out
 dev
 *.exe

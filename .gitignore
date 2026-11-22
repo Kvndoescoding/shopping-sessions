@@ -2,3 +2,4 @@ pipeline
 *.exe
 out/
 dev/
+target/
